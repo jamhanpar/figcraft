@@ -10,11 +10,19 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// One catalog entry.
+/// One catalog entry. Two words: the plural forms sit behind a reference, so the ~52,000 baked-in
+/// rows don't each carry four strings' worth of space (about 450 KB of the browser build).
 pub enum Text {
     Plain(&'static str),
-    /// Plural forms: `one` (when the language has it) and `other`.
-    Plural(Option<&'static str>, &'static str),
+    Plural(&'static Forms),
+}
+
+/// Optional language-specific plural forms, with `other` as the fallback.
+pub struct Forms {
+    pub one: Option<&'static str>,
+    pub few: Option<&'static str>,
+    pub many: Option<&'static str>,
+    pub other: &'static str,
 }
 
 /// A language's catalog (generated from `locales/<code>.toml`).
@@ -22,7 +30,8 @@ pub struct Lang {
     pub code: &'static str,
     /// The language's own name for itself (the language picker shows it untranslated).
     pub name: &'static str,
-    /// Machine-drafted, waiting for a native speaker's review (`[meta] status`).
+    /// A draft (`[meta] status` set): waiting for a native speaker's review, or reviewed and waiting for
+    /// a maintainer's approval.
     pub draft: bool,
     /// Index into [`LANGS`] of the catalog a regional one overlays ("es" under "es-419": it lists
     /// only what differs), else 0 (English).
@@ -103,9 +112,14 @@ fn lookup(lang: usize, key: &str) -> Option<&'static Text> {
 /// The UI string for `key` (its English text) in the current language. One English text that needs
 /// two translations gets a context after `|` ("Fill|sizing"); the English catalog maps it back.
 pub fn tr(key: &str) -> &str {
-    match lookup(CURRENT.load(Ordering::Relaxed), key) {
-        Some(Text::Plain(s) | Text::Plural(_, s)) => s,
-        None => key,
+    try_tr(key).unwrap_or(key)
+}
+
+/// [`tr`] for text that comes from data and may have no catalog entry (an importer's notes, say):
+/// `None` when the catalog doesn't have it.
+pub fn try_tr(key: &str) -> Option<&str> {
+    match lookup(CURRENT.load(Ordering::Relaxed), key)? {
+        Text::Plain(s) | Text::Plural(Forms { other: s, .. }) => Some(s),
     }
 }
 
@@ -123,26 +137,67 @@ pub fn trf(key: &str, args: &[(&str, &dyn Display)]) -> String {
 /// The plural form of `key` (its English "other" form) for count `n`, with `{n}` and `args` filled.
 pub fn trn(key: &str, n: usize, args: &[(&str, &dyn Display)]) -> String {
     let lang = CURRENT.load(Ordering::Relaxed);
-    let text = match lookup(lang, key) {
-        Some(Text::Plural(one, other)) => one.filter(|_| plural_one(lang, n)).unwrap_or(other),
-        Some(Text::Plain(s)) => s,
-        None => key,
-    };
+    let text = counted(lang, key, n);
     let mut all: Vec<(&str, &dyn Display)> = vec![("n", &n)];
     all.extend_from_slice(args);
     fill(text, &all)
 }
 
-/// Whether count `n` takes the "one" form: 0 and 1 in French and Brazilian Portuguese, never in
-/// Japanese, Korean and Chinese (no plural forms: always "other"), 1 elsewhere (CLDR's integer rules).
-// shortcut: CLDR's "many" (French, Spanish and Portuguese millions) reads as "other" here; add it
-// when a language needs a third form.
-fn plural_one(lang: usize, n: usize) -> bool {
-    match LANGS.get(lang).map(|l| l.code) {
-        Some("ja" | "ko" | "zh-Hans") => false,
-        Some("fr" | "pt-BR") => n <= 1,
-        _ => n == 1,
+/// Pick a plural using the catalog that supplies the text: an English fallback keeps English's
+/// rule, even when the selected language is Russian.
+fn counted(lang: usize, key: &str, n: usize) -> &str {
+    chain(lang)
+        .find_map(|l| {
+            find(l.ui, key).map(|text| match text {
+                Text::Plain(s) => *s,
+                Text::Plural(Forms { one, few, many, other }) => match plural(l.code, n) {
+                    Plural::One => one.unwrap_or(other),
+                    Plural::Few => few.unwrap_or(other),
+                    Plural::Many => many.unwrap_or(other),
+                    Plural::Other => other,
+                },
+            })
+        })
+        .unwrap_or(key)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Plural {
+    One,
+    Few,
+    Many,
+    Other,
+}
+
+/// CLDR integer rules. Existing one/other catalogs may omit the extra forms.
+fn plural(code: &str, n: usize) -> Plural {
+    match code {
+        "cs" if n == 1 => Plural::One,
+        "cs" if (2..=4).contains(&n) => Plural::Few,
+        "cs" => Plural::Other,
+        "pl" if n == 1 => Plural::One,
+        "ru" if n % 10 == 1 && n % 100 != 11 => Plural::One,
+        "ru" | "pl" if (2..=4).contains(&(n % 10)) && !(12..=14).contains(&(n % 100)) => Plural::Few,
+        "ru" | "pl" => Plural::Many,
+        "bs" if n % 10 == 1 && n % 100 != 11 => Plural::One,
+        "bs" if (2..=4).contains(&(n % 10)) && !(12..=14).contains(&(n % 100)) => Plural::Few,
+        "bs" => Plural::Other,
+        "ja" | "ko" | "th" | "zh-Hans" | "vi" => Plural::Other,
+        "fr" | "pt-BR" if n <= 1 => Plural::One,
+        _ if n == 1 => Plural::One,
+        _ => Plural::Other,
     }
+}
+
+// CLDR's million-count "many" in French, Spanish and Portuguese still reads their existing
+// "other" wording. Czech supplies separate few forms; Russian and Polish supply few/many forms;
+// Bosnian takes Russian's one and few and reads "other" for the rest (CLDR has no "many" there).
+
+/// Whether count `n` takes the "one" form: 0 and 1 in French and Brazilian Portuguese, never in
+/// Japanese, Korean, Thai, Chinese and Vietnamese (no plural forms: always "other"), 1 elsewhere (CLDR's integer rules).
+#[cfg(test)]
+fn plural_one(lang: usize, n: usize) -> bool {
+    plural(LANGS.get(lang).map_or("en", |l| l.code), n) == Plural::One
 }
 
 /// Replace each `{name}` in `text` with its argument, in one pass (an argument's own braces stay).
@@ -186,12 +241,11 @@ pub fn menu_item<'a>(id: &str, english: &'a str) -> Cow<'a, str> {
 fn label<'a>(menu: bool, id: &str, english: &'a str) -> Cow<'a, str> {
     let text = chain(CURRENT.load(Ordering::Relaxed)).find_map(|l| menu.then(|| find(l.menu, id)).flatten().or_else(|| find(l.commands, id)));
     match text {
-        Some(Text::Plain(s) | Text::Plural(_, s)) if english.ends_with('…') && !s.ends_with('…') => Cow::Owned(format!("{s}…")),
-        Some(Text::Plain(s) | Text::Plural(_, s)) => Cow::Borrowed(s),
+        Some(Text::Plain(s) | Text::Plural(Forms { other: s, .. })) if english.ends_with('…') && !s.ends_with('…') => Cow::Owned(format!("{s}…")),
+        Some(Text::Plain(s) | Text::Plural(Forms { other: s, .. })) => Cow::Borrowed(s),
         None => Cow::Borrowed(english),
     }
 }
 
 #[cfg(test)]
-#[path = "i18n_tests.rs"]
 mod tests;

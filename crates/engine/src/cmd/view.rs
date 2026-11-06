@@ -1,10 +1,10 @@
 //! View menu, preferences and tools. View state is per document and drivable like everything else.
 
-use figcraft_doc::*;
+use figcraft_doc::NodeId;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, ok};
-use crate::params::*;
+use crate::params::{boolean, get, num, num_or, req_index, req_num, req_string, string};
 use crate::tools::ToolId;
 use crate::{EngineError, Result, Session, ViewState, bad, spec};
 
@@ -19,30 +19,58 @@ fn flag(s: &mut Session, p: &Value, f: fn(&mut ViewState) -> &mut bool) -> Resul
     Ok(json!({"on": *slot}))
 }
 
+/// One of a view's on/off settings.
+type Slot = fn(&mut ViewState) -> &mut bool;
+
+/// The View menu's on/off toggles (Pixel preview, with its scale, has its own command), and
+/// whether the preferences keep each: files opened or made later start with the kept ones. Outline
+/// modes and the sRGB soft-proof stay with their file, so a new file never opens in one.
+const TOGGLES: &[(&str, Slot, bool)] = &[
+    ("view.pixelGrid", |v| &mut v.pixel_grid, true),
+    ("view.layoutGrids", |v| &mut v.layout_grids, true),
+    ("view.rulers", |v| &mut v.rulers, true),
+    ("view.slices", |v| &mut v.show_slices, true),
+    ("view.comments", |v| &mut v.comments, true),
+    ("view.multiplayerCursors", |v| &mut v.multiplayer_cursors, true),
+    ("view.outlines", |v| &mut v.outlines, false),
+    ("view.outlinesSelection", |v| &mut v.outlines_selection, false),
+    ("view.outlinesHiddenLayers", |v| &mut v.outline_hidden, true),
+    ("view.outlinesObjectBounds", |v| &mut v.outline_bounds, true),
+    ("view.maskOutlines", |v| &mut v.mask_outlines, true),
+    ("view.frameOutlines", |v| &mut v.frame_outlines, true),
+    ("view.proofSrgb", |v| &mut v.proof_srgb, false),
+    ("view.snapGeometry", |v| &mut v.snap_geometry, true),
+    ("view.snapObjects", |v| &mut v.snap_objects, true),
+    ("view.snapPixel", |v| &mut v.snap_pixel, true),
+];
+
+/// View toggle `id`: the file's view changes, and the preferences remember a kept one.
+fn toggle(s: &mut Session, p: &Value, id: &str) -> Result<Value> {
+    let Some(&(_, f, keep)) = TOGGLES.iter().find(|(k, ..)| *k == id) else { return Err(bad(id, "not a View toggle")) };
+    let r = flag(s, p, f)?;
+    if keep && let Some(on) = r.get("on").and_then(Value::as_bool) {
+        s.prefs.view.insert(id.to_string(), on);
+    }
+    Ok(r)
+}
+
+/// Set `v`'s View toggles to the ones the preferences keep (the others stay as they are).
+pub(crate) fn apply_kept(prefs: &crate::Prefs, v: &mut ViewState) {
+    for (id, f, _) in TOGGLES.iter().filter(|t| t.2) {
+        if let Some(on) = prefs.view.get(*id) {
+            *f(v) = *on;
+        }
+    }
+}
+
 /// Whether the View menu's toggle `id` is on (the menus show a check mark); `None` for a command
 /// that isn't one.
 pub fn checked(s: &Session, id: &str) -> Option<bool> {
-    let v = &s.ds().ok()?.view;
-    Some(match id {
-        "view.pixelGrid" => v.pixel_grid,
-        "view.layoutGrids" => v.layout_grids,
-        "view.rulers" => v.rulers,
-        "view.slices" => v.show_slices,
-        "view.comments" => v.comments,
-        "view.multiplayerCursors" => v.multiplayer_cursors,
-        "view.outlines" => v.outlines,
-        "view.outlinesSelection" => v.outlines_selection,
-        "view.outlinesHiddenLayers" => v.outline_hidden,
-        "view.outlinesObjectBounds" => v.outline_bounds,
-        "view.maskOutlines" => v.mask_outlines,
-        "view.pixelPreview" => v.pixel_preview,
-        "view.frameOutlines" => v.frame_outlines,
-        "view.proofSrgb" => v.proof_srgb,
-        "view.snapGeometry" => v.snap_geometry,
-        "view.snapObjects" => v.snap_objects,
-        "view.snapPixel" => v.snap_pixel,
-        _ => return None,
-    })
+    let mut v = s.ds().ok()?.view.clone();
+    if id == "view.pixelPreview" {
+        return Some(v.pixel_preview);
+    }
+    TOGGLES.iter().find(|(k, ..)| *k == id).map(|(_, f, _)| *f(&mut v))
 }
 
 /// Pixel preview: toggles, or turns on at a resolution of 1x or 2x.
@@ -138,8 +166,16 @@ fn page_step(s: &mut Session, dir: i64) -> Result<Value> {
     let pages = &ds.doc.pages;
     let i = pages.iter().position(|p| *p == ds.page).unwrap_or(0) as i64;
     let n = pages.len() as i64;
-    let next = (i + dir).clamp(0, n - 1) as usize;
-    let Some(pg) = pages.get(next).copied() else { return ok() };
+    // Dividers never open: step over them, and stay put when only dividers lie ahead.
+    let mut next = i + dir;
+    let pg = loop {
+        let page = usize::try_from(next).ok().and_then(|k| pages.get(k).copied());
+        match page {
+            Some(p) if !ds.doc.is_divider(p) => break p,
+            Some(_) if dir != 0 && next >= 0 && next < n => next += dir,
+            _ => break ds.page,
+        }
+    };
     let ds = s.ds_mut()?;
     ds.page = pg;
     ds.selection.clear();
@@ -158,15 +194,32 @@ fn region(s: &mut Session, step: i64) -> Result<Value> {
     ok()
 }
 
+/// Step the interface size through the Preferences sizes: `dir` 1 up, -1 down, 0 back to the
+/// system's size (1). At an end it stays. Kept at once, as a size picked in Preferences is.
+fn ui_scale_step(s: &mut Session, dir: i32) -> Result<Value> {
+    let now = s.prefs.ui_scale;
+    let next = match dir {
+        0 => 1.0,
+        1 => crate::UI_SCALE_SIZES.iter().copied().find(|v| *v > now + 1e-9).unwrap_or(now),
+        _ => crate::UI_SCALE_SIZES.iter().rev().copied().find(|v| *v < now - 1e-9).unwrap_or(now),
+    };
+    if (next - now).abs() > 1e-9 {
+        s.prefs.ui_scale = next;
+        s.prefs_unsaved = true;
+    }
+    Ok(json!({"scale": s.prefs.ui_scale}))
+}
+
 fn pref(s: &mut Session, p: &Value, f: fn(&mut crate::Prefs) -> &mut bool) -> Result<Value> {
     let slot = f(&mut s.prefs);
     *slot = boolean(p, "on").unwrap_or(!*slot);
     Ok(json!({"on": *slot}))
 }
 
-fn tool(s: &mut Session, t: ToolId) -> Result<Value> {
-    // A file you can't edit now (view only, or on its way to a server): moving around only.
-    if let Some(why) = s.active_read_only().filter(|_| !matches!(t, ToolId::Move | ToolId::Hand)) {
+pub(crate) fn tool(s: &mut Session, t: ToolId) -> Result<Value> {
+    // A file you can't edit now (view only, or on its way to a server): moving around only, and
+    // commenting with a comment link.
+    if let Some(why) = s.active_read_only().filter(|why| !crate::live::tool_left(why, t)) {
         return Err(EngineError::Disabled(format!("tool.{}", t.id()), why.into()));
     }
     s.set_tool(t);
@@ -227,47 +280,58 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("view.nextFrame", "Zoom to next frame", "{}", false, |s, _| zoom_frame(s, 1)),
         spec!("view.prevPage", "Previous page", "{}", false, |s, _| page_step(s, -1)),
         spec!("view.nextPage", "Next page", "{}", false, |s, _| page_step(s, 1)),
-        spec!("view.pixelGrid", "Pixel grid", "{on?}", false, |s, p| flag(s, p, |v| &mut v.pixel_grid)),
-        spec!("view.layoutGrids", "Layout grids", "{on?}", false, |s, p| flag(s, p, |v| &mut v.layout_grids)),
-        spec!("view.rulers", "Rulers", "{on?}", false, |s, p| flag(s, p, |v| &mut v.rulers)),
-        spec!("view.slices", "Slices", "{on?}", false, |s, p| flag(s, p, |v| &mut v.show_slices)),
-        spec!("view.comments", "Comments", "{on?}", false, |s, p| flag(s, p, |v| &mut v.comments)),
+        spec!("view.pixelGrid", "Pixel grid", "{on?}", false, |s, p| toggle(s, p, "view.pixelGrid")),
+        spec!("view.layoutGrids", "Layout grids", "{on?}", false, |s, p| toggle(s, p, "view.layoutGrids")),
+        spec!("view.rulers", "Rulers", "{on?}", false, |s, p| toggle(s, p, "view.rulers")),
+        spec!("view.slices", "Slices", "{on?}", false, |s, p| toggle(s, p, "view.slices")),
+        spec!("view.comments", "Comments", "{on?}", false, |s, p| toggle(s, p, "view.comments")),
         spec!("view.multiplayerCursors", "Multiplayer cursors", "{on?}  others' cursors in a live session", false, |s, p| {
-            flag(s, p, |v| &mut v.multiplayer_cursors)
+            toggle(s, p, "view.multiplayerCursors")
         }),
         spec!("view.pan", "Pan the view", "{dx, dy (arrow-key steps, e.g. 1 or -1), big? (ten times as far, like Shift)}", false, pan),
-        spec!("view.outlines", "Outlines", "{on?}", false, |s, p| flag(s, p, |v| &mut v.outlines)),
+        spec!("view.outlines", "Outlines", "{on?}", false, |s, p| toggle(s, p, "view.outlines")),
         spec!("view.outlinesSelection", "Outlines for selection", "{on?}  outline mode for the selected layers only", false, |s, p| {
-            flag(s, p, |v| &mut v.outlines_selection)
+            toggle(s, p, "view.outlinesSelection")
         }),
         spec!(
             "view.outlinesHiddenLayers",
             "Include hidden layers in outlines",
             "{on?}  outline mode (and outlines for the selection) outlines hidden layers too; they can be clicked there",
             false,
-            |s, p| { flag(s, p, |v| &mut v.outline_hidden) }
+            |s, p| { toggle(s, p, "view.outlinesHiddenLayers") }
         ),
         spec!(
             "view.outlinesObjectBounds",
             "Include object bounds in outlines",
             "{on?}  outline mode also draws each layer's box (groups, text, vectors); a click on a box's edge picks its layer",
             false,
-            |s, p| { flag(s, p, |v| &mut v.outline_bounds) }
+            |s, p| { toggle(s, p, "view.outlinesObjectBounds") }
         ),
-        spec!("view.maskOutlines", "Mask outlines", "{on?}", false, |s, p| flag(s, p, |v| &mut v.mask_outlines)),
+        spec!("view.maskOutlines", "Mask outlines", "{on?}", false, |s, p| toggle(s, p, "view.maskOutlines")),
         spec!("view.pixelPreview", "Pixel preview", "{on?, scale? (1|2: rendered pixels per page pixel; turns it on)}", false, pixel_preview),
-        spec!("view.frameOutlines", "Frame outlines", "{on?}", false, |s, p| flag(s, p, |v| &mut v.frame_outlines)),
+        spec!("view.frameOutlines", "Frame outlines", "{on?}", false, |s, p| toggle(s, p, "view.frameOutlines")),
         spec!(
             "view.proofSrgb",
             "Soft-proof sRGB",
             "{on?}  mark the colours of a Display P3 file that sRGB screens and files can't show",
             false,
-            |s, p| { flag(s, p, |v| &mut v.proof_srgb) }
+            |s, p| { toggle(s, p, "view.proofSrgb") }
         ),
-        spec!("view.snapGeometry", "Snap to geometry", "{on?}", false, |s, p| flag(s, p, |v| &mut v.snap_geometry)),
-        spec!("view.snapObjects", "Snap to objects", "{on?}", false, |s, p| flag(s, p, |v| &mut v.snap_objects)),
-        spec!("view.snapPixel", "Snap to pixel grid", "{on?}", false, |s, p| flag(s, p, |v| &mut v.snap_pixel)),
+        spec!("view.snapGeometry", "Snap to geometry", "{on?}", false, |s, p| toggle(s, p, "view.snapGeometry")),
+        spec!("view.snapObjects", "Snap to objects", "{on?}", false, |s, p| toggle(s, p, "view.snapObjects")),
+        spec!("view.snapPixel", "Snap to pixel grid", "{on?}", false, |s, p| toggle(s, p, "view.snapPixel")),
         spec!("view.toggleUi", "Show/Hide UI", "{on?}", false, |s, p| flag(s, p, |v| &mut v.ui_hidden)),
+        spec!(
+            "view.minimize",
+            "Minimize the interface",
+            "{on?}  collapses the navigation bar and both sidebars and keeps the toolbar (Shift+Cmd/Ctrl+\\, the Minimize button by the file name); the right sidebar shows while something is selected",
+            false,
+            |s, p| flag(s, p, |v| &mut v.ui_minimized)
+        ),
+        spec!("view.fullscreen", "Full screen", "{on?}  the window fills the screen (the desktop app; a no-op headless)", false, |s, p| {
+            s.request_ui("window.fullscreen", json!({"on": boolean(p, "on")}));
+            ok()
+        }),
         spec!("view.layers", "Layers panel", "{}", false, |s, _| ui(s, "panel.layers")),
         spec!("view.assets", "Assets panel", "{}", false, |s, _| ui(s, "panel.assets")),
         spec!("view.design", "Design panel", "{}", false, |s, _| ui(s, "panel.design")),
@@ -329,18 +393,66 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("pref.renameDuplicates", "Rename duplicated layers", "{on?}", false, |s, p| pref(s, p, |x| &mut x.rename_duplicates)),
         spec!("pref.showDimensions", "Show dimensions on objects", "{on?}", false, |s, p| pref(s, p, |x| &mut x.show_dimensions)),
         spec!("pref.numberKeysOpacity", "Use number keys for opacity", "{on?}", false, |s, p| pref(s, p, |x| &mut x.number_keys_opacity)),
+        spec!(
+            "pref.scrollWheelZoom",
+            "Scroll wheel zoom",
+            "{on?}  a mouse wheel zooms the canvas about the pointer and Cmd/Ctrl+wheel scrolls it (Shift+wheel still scrolls sideways; trackpads are unchanged) → {on}",
+            false,
+            |s, p| pref(s, p, |x| &mut x.scroll_wheel_zoom)
+        ),
         spec!("pref.reduceMotion", "Reduce motion", "{on?}", false, |s, p| pref(s, p, |x| &mut x.reduce_motion)),
+        spec!(
+            "pref.uiScale",
+            "Interface size",
+            "{scale? (a size from 0.75 to 3 relative to the system's display scale: 1 is the system's own size, so 1.25 is 125 %, not 125; outside the range it stops at the nearest end; \"auto\" is 1; omit: just read it)} → {scale}: how large the whole interface is drawn; the canvas zoom is separate",
+            false,
+            |s, p| {
+                match get(p, "scale") {
+                    None => {}
+                    Some(Value::String(v)) if v.trim().eq_ignore_ascii_case("auto") => s.prefs.ui_scale = 1.0,
+                    Some(_) => {
+                        let scale = req_num("pref.uiScale", p, "scale")?;
+                        s.prefs.ui_scale = crate::clamp_ui_scale(scale).ok_or_else(|| bad("pref.uiScale", "`scale` must be a finite number"))?;
+                    }
+                }
+                Ok(json!({"scale": s.prefs.ui_scale}))
+            }
+        ),
+        spec!(
+            "pref.uiScaleUp",
+            "Larger interface",
+            "{}  the next of the Preferences sizes above the current one (the interface size keys of Accessibility at Figma); at the largest it stays → {scale}",
+            false,
+            |s, _| ui_scale_step(s, 1)
+        ),
+        spec!(
+            "pref.uiScaleDown",
+            "Smaller interface",
+            "{}  the next of the Preferences sizes below the current one; at the smallest it stays → {scale}",
+            false,
+            |s, _| ui_scale_step(s, -1)
+        ),
+        spec!("pref.uiScaleReset", "Default interface size", "{}  back to the system's own size (1) → {scale}", false, |s, _| ui_scale_step(s, 0)),
+        spec!("pref.autoSave", "Save files automatically", "{on?}", false, |s, p| pref(s, p, |x| &mut x.auto_save)),
+        spec!("pref.startOnHome", "Start on the Home screen", "{on?}", false, |s, p| pref(s, p, |x| &mut x.start_on_home)),
         spec!("pref.nudge", "Nudge amount", "{small?, big?}", false, |s, p| {
             s.prefs.nudge_small = num(p, "small").unwrap_or(s.prefs.nudge_small).clamp(0.01, 1000.0);
             s.prefs.nudge_big = num(p, "big").unwrap_or(s.prefs.nudge_big).clamp(0.01, 10000.0);
             Ok(json!({"small": s.prefs.nudge_small, "big": s.prefs.nudge_big}))
         }),
-        spec!("pref.userName", "Your name in comments", "{name (blank: the default, \"You\")}", false, |s, p| {
-            let name = req_string("pref.userName", p, "name")?;
-            let name: String = name.trim().chars().filter(|c| !c.is_control()).take(64).collect();
-            s.prefs.user_name = if name.is_empty() { super::comment::DEFAULT_AUTHOR.into() } else { name };
-            Ok(json!({"name": s.prefs.user_name}))
-        }),
+        spec!(
+            "pref.userName",
+            "Your name",
+            "{name (blank: the default: \"You\" on comments, \"Guest N\" in live sessions)} → {name}: what your comments are signed with and others see you as in live sessions; the live sessions you're in show the new name at once (blank keeps the name they gave you until you join again)",
+            false,
+            |s, p| {
+                let name = req_string("pref.userName", p, "name")?;
+                let name: String = name.trim().chars().filter(|c| !c.is_control()).take(crate::live::MAX_NAME).collect();
+                s.prefs.user_name = if name.is_empty() { super::comment::DEFAULT_AUTHOR.into() } else { name };
+                s.live_rename();
+                Ok(json!({"name": s.prefs.user_name}))
+            }
+        ),
         spec!(
             "pref.publishServer",
             "Server for online sharing",
@@ -365,18 +477,24 @@ pub fn specs() -> Vec<CommandSpec> {
                 Ok(json!({"url": s.prefs.publish_server, "default": crate::live::DEFAULT_SERVER}))
             }
         ),
-        spec!("pref.language", "Interface language", "{language: system|en|es|es-419|fr|de|pt-BR|ja|ko|zh-Hans|…; else English}", false, |s, p| {
-            let lang = req_string("pref.language", p, "language")?;
-            let lang = lang.trim();
-            // A BCP 47-style tag ("es", "pt-BR", "zh_Hans") or "system".
-            let tag = lang.len() <= 35
-                && lang.split(['-', '_']).all(|part| !part.is_empty() && part.len() <= 8 && part.chars().all(|c| c.is_ascii_alphanumeric()));
-            if !tag {
-                return Err(bad("pref.language", format!("`{lang}` is not a language code")));
+        spec!(
+            "pref.language",
+            "Interface language",
+            "{language: system|en|bs|cs|ru|es|es-419|fr|de|pt-BR|ja|ka|ko|vi|zh-Hans|…; else English}",
+            false,
+            |s, p| {
+                let lang = req_string("pref.language", p, "language")?;
+                let lang = lang.trim();
+                // A BCP 47-style tag ("es", "pt-BR", "zh_Hans") or "system".
+                let tag = lang.len() <= 35
+                    && lang.split(['-', '_']).all(|part| !part.is_empty() && part.len() <= 8 && part.chars().all(|c| c.is_ascii_alphanumeric()));
+                if !tag {
+                    return Err(bad("pref.language", format!("`{lang}` is not a language code")));
+                }
+                s.prefs.language = lang.to_string();
+                Ok(json!({"language": s.prefs.language}))
             }
-            s.prefs.language = lang.to_string();
-            Ok(json!({"language": s.prefs.language}))
-        }),
+        ),
         spec!("app.preferences", "Preferences", "{}", false, |s, _| ui(s, "dialog.preferences")),
         spec!("app.actions", "Actions", "{}", false, |s, _| ui(s, "palette.actions")),
         spec!("help.shortcuts", "Keyboard shortcuts", "{}", false, |s, _| ui(s, "panel.shortcuts")),
@@ -400,11 +518,14 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!(
             "tool.set",
             "Choose tool",
-            "{tool: move|scale|hand|frame|section|slice|rectangle|line|arrow|ellipse|polygon|star|pen|pencil|text|comment|shapeBuilder}",
+            "{tool: move|scale|hand|frame|section|slice|rectangle|line|arrow|ellipse|polygon|star|pen|pencil|text|comment|shapeBuilder | on boards: sticky|shape|connector|marker|highlighter|eraser|stamp}",
             false,
             |s, p| {
                 let t = req_string("tool.set", p, "tool")?;
                 let t = ToolId::from_id(&t).ok_or_else(|| bad("tool.set", format!("unknown tool `{t}`")))?;
+                if t.on_boards() {
+                    crate::board::require(s, &format!("tool.{}", t.id()))?;
+                }
                 tool(s, t)
             }
         ),
@@ -467,11 +588,42 @@ pub fn specs() -> Vec<CommandSpec> {
         spec!("tool.pen", "Pen", "{}", false, |s, _| tool(s, ToolId::Pen)),
         spec!("tool.pencil", "Pencil", "{}", false, |s, _| tool(s, ToolId::Pencil)),
         spec!("tool.text", "Text", "{}", false, |s, _| tool(s, ToolId::Text)),
+        spec!("tool.textOnPath", "Text on a path", "{}  a click on a shape's or vector's path puts new text on it", false, |s, _| {
+            tool(s, ToolId::TextOnPath)
+        }),
         spec!("tool.comment", "Comment", "{}", false, |s, _| tool(s, ToolId::Comment)),
         spec!("tool.shapeBuilder", "Shape builder", "{}", false, |s, _| tool(s, ToolId::ShapeBuilder)),
-        spec!("edit.pickColor", "Pick color", "{}", false, |s, _| tool(s, ToolId::Eyedropper)),
+        // `apply: false` is for the UI colour picker: the eyedropper only samples (into
+        // `ToolState::picked`) and the picker writes the colour to the paint it edits.
+        spec!("edit.pickColor", "Pick color", "{apply?}", false, |s, p| {
+            let r = tool(s, ToolId::Eyedropper)?;
+            s.tool.pick_only = !boolean(p, "apply").unwrap_or(true);
+            s.tool.picked = None;
+            Ok(r)
+        }),
     ]
 }
 
 #[allow(dead_code)]
 fn unused(_: NodeId) {}
+
+#[cfg(test)]
+mod start_on_home_tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn start_on_home_is_a_preference_that_persists() {
+        let mut s = Session::new();
+        assert!(!s.prefs.start_on_home);
+        assert_eq!(s.execute("pref.startOnHome", &json!({})).unwrap()["on"], true);
+        assert!(s.prefs.start_on_home);
+        // Saved with the other preferences and read back; older settings files without it read as off.
+        let saved: crate::Prefs = serde_json::from_value(serde_json::to_value(&s.prefs).unwrap()).unwrap();
+        assert!(saved.start_on_home);
+        assert_eq!(s.execute("pref.startOnHome", &json!({"on": false})).unwrap()["on"], false);
+        let old: crate::Prefs = serde_json::from_value(json!({"theme": "dark"})).unwrap();
+        assert!(!old.start_on_home);
+    }
+}

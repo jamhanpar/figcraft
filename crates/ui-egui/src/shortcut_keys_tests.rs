@@ -2,7 +2,8 @@
 //! headless: arrows pan with nothing selected, the keyboard box selection key and Cmd/Ctrl+arrows
 //! drawing it out, list indentation while editing text, symbols another keyboard layout types with
 //! Shift, the presentation keys (Space and N forward, C comments, F full screen), Alt+R for the
-//! rotation origin and Enter placing a shape with its tool chosen.
+//! rotation origin, Enter placing a shape with its tool chosen and Cmd/Ctrl+= and - zooming the
+//! canvas, not the interface.
 
 use egui::{Event, Key, Modifiers, ViewportCommand, ViewportId};
 use figcraft_doc::NodeId;
@@ -188,4 +189,91 @@ fn enter_with_a_shape_tool_places_one_in_the_middle_of_the_view() {
     // With the Move tool back, Enter on the shape edits it as before.
     press(&mut u, Key::Enter, Modifiers::NONE);
     assert!(u.app.session.ds().unwrap().vector_edit.is_some());
+}
+
+#[test]
+fn full_screen_key_and_command_toggle_the_window() {
+    let mut u = Ui::new(Session::new());
+    let fullscreen = |out: &egui::FullOutput| -> Vec<ViewportCommand> {
+        out.viewport_output.get(&ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
+    };
+    // F11 (Windows and Linux) or Ctrl+Cmd+F (macOS) asks the window to fill the screen.
+    let out = if crate::shortcuts::platform() == Platform::Mac {
+        press(&mut u, Key::F, Modifiers::MAC_CMD | Modifiers::COMMAND | Modifiers::CTRL)
+    } else {
+        press(&mut u, Key::F11, Modifiers::NONE)
+    };
+    assert!(fullscreen(&out).contains(&ViewportCommand::Fullscreen(true)), "full screen key, {:?}", fullscreen(&out));
+    // `on: false` leaves it, whatever the window reports.
+    u.app.run("view.fullscreen", json!({"on": false}));
+    let out = u.frame_output(vec![]);
+    assert!(fullscreen(&out).contains(&ViewportCommand::Fullscreen(false)), "{:?}", fullscreen(&out));
+    // Junk parameters are ignored, not fatal.
+    u.app.run("view.fullscreen", json!({"on": "yes"}));
+    u.frame(vec![]);
+}
+
+#[test]
+fn cmd_plus_and_minus_zoom_the_canvas_not_the_interface() {
+    let mut u = Ui::new(Session::new());
+    u.app.run("view.set", json!({"zoom": 1.0, "cx": 0, "cy": 0}));
+    press(&mut u, Key::Equals, cmd());
+    // egui applies a new zoom factor at the start of the next frame.
+    u.frame(vec![]);
+    assert!(view(&u).2 > 1.0, "Cmd/Ctrl+= zooms the canvas in: {}", view(&u).2);
+    assert_eq!(u.ctx.zoom_factor(), 1.0, "and leaves the interface at its size");
+    press(&mut u, Key::Minus, cmd());
+    press(&mut u, Key::Minus, cmd());
+    u.frame(vec![]);
+    assert!(view(&u).2 < 1.0, "Cmd/Ctrl+- zooms the canvas out: {}", view(&u).2);
+    assert_eq!(u.ctx.zoom_factor(), 1.0);
+}
+
+/// "Press ⌘Command ⌥Option ↑/ ↓ on Mac or Control Alt ↑/↓ on Windows to rotate an object one
+/// degree at a time" and with Shift "15 degrees at a time" (Accessibility at Figma). The keys
+/// turned the selection's size before; Cmd/Ctrl+arrows without Alt still resize.
+#[test]
+fn cmd_alt_arrows_rotate_a_degree_and_fifteen_with_shift() {
+    let mut s = Session::new();
+    let r = id(s.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 40, "height": 40})).unwrap());
+    let mut u = Ui::new(s);
+    u.app.run("select.set", json!({"ids": [r]}));
+    let rot = |u: &Ui| figcraft_geom::rotation_degrees(u.app.session.doc().unwrap().node(r).unwrap().transform);
+    let size = |u: &Ui| {
+        let n = u.app.session.doc().unwrap().node(r).unwrap().clone();
+        (n.width, n.height)
+    };
+    press(&mut u, Key::ArrowDown, cmd() | Modifiers::ALT);
+    assert!((rot(&u) - 1.0).abs() < 1e-6, "one degree: {}", rot(&u));
+    press(&mut u, Key::ArrowDown, cmd() | Modifiers::ALT | Modifiers::SHIFT);
+    assert!((rot(&u) - 16.0).abs() < 1e-6, "fifteen more: {}", rot(&u));
+    press(&mut u, Key::ArrowUp, cmd() | Modifiers::ALT);
+    assert!((rot(&u) - 15.0).abs() < 1e-6, "one back: {}", rot(&u));
+    assert_eq!(size(&u), (40.0, 40.0), "no resize");
+    press(&mut u, Key::ArrowDown, cmd());
+    assert_eq!(size(&u), (40.0, 41.0), "Cmd/Ctrl+arrows alone still resize");
+    // Two layers turned together: the turns go about the rotated selection box's centre, so a
+    // degree down and a degree up leave both where they were.
+    let c = id(u.app.session.execute("shape.rectangle", &json!({"x": 200, "y": 0, "width": 40, "height": 40})).unwrap());
+    let d = id(u.app.session.execute("shape.rectangle", &json!({"x": 300, "y": 60, "width": 30, "height": 20})).unwrap());
+    u.app.run("select.set", json!({"ids": [c, d]}));
+    u.app.run("transform.rotate", json!({"degrees": 30}));
+    let bounds = |u: &Ui| [c, d].map(|n| u.app.session.doc().unwrap().world_bounds(n).unwrap());
+    let before = bounds(&u);
+    press(&mut u, Key::ArrowDown, cmd() | Modifiers::ALT);
+    press(&mut u, Key::ArrowUp, cmd() | Modifiers::ALT);
+    let after = bounds(&u);
+    for (x, y) in before.iter().zip(&after) {
+        assert!(
+            (x.x0 - y.x0).abs() < 1e-6 && (x.y0 - y.y0).abs() < 1e-6 && (x.x1 - y.x1).abs() < 1e-6 && (x.y1 - y.y1).abs() < 1e-6,
+            "{x:?} then {y:?}"
+        );
+    }
+    // While points are being edited the chord does nothing to the layer.
+    u.app.run("select.set", json!({"ids": [r]}));
+    let rot_before = rot(&u);
+    u.app.run("vector.edit.begin", json!({"id": r}));
+    press(&mut u, Key::ArrowDown, cmd() | Modifiers::ALT);
+    assert!((rot(&u) - rot_before).abs() < 1e-6, "no turn while editing points");
+    u.app.run("vector.edit.end", json!({}));
 }

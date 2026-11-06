@@ -2,7 +2,8 @@
 //! memory cap, and sees the outside world only through the host functions below. There is no WASI:
 //! no file system, network, clock or randomness.
 //!
-//! # ABI (version 3; version 1 is the first seven imports, version 2 adds panels and settings)
+//! # ABI (version 4; version 1 is the first seven imports, version 2 adds panels and settings,
+//! version 3 widgets, version 4 `save_file`)
 //!
 //! The module exports its `memory` and `figcraft_run(input_len: i32) -> i32`. Host functions are
 //! imported from the module `figcraft`; strings are UTF-8 `(ptr, len)` pairs in the plugin's memory.
@@ -22,6 +23,7 @@
 //! | `setting_set` | `(key_ptr, key_len, value_ptr, value_len) -> i32` | Stores JSON under the key. 1: refused, the reply says why. |
 //! | `setting_delete` | `(key_ptr, key_len)` | Forgets a setting. |
 //! | `widget_render` | `(ptr, len) -> i32` | Draws the widget being called back: a [`WidgetRender`] as JSON. 1: invalid, the reply says why. |
+//! | `save_file` | `(name_ptr, name_len, mime_ptr, mime_len, data_ptr, data_len) -> i32` | Offers a file to save (needs `permissions.saveFile`). The host asks the user where it goes; the plugin never gets a path. 0: accepted, 1: refused, the reply says why. |
 //!
 //! When `figcraft_run` starts, the reply holds the input JSON (`input_len` bytes):
 //! `{"api", "command", "params", "selection"}`, plus `event` and `values` when a panel calls the
@@ -58,12 +60,14 @@ const IMPORTS: &[(&str, usize, usize)] = &[
     ("setting_set", 4, 1),
     ("setting_delete", 2, 0),
     ("widget_render", 2, 1),
+    ("save_file", 6, 1),
 ];
 
 /// What a run may use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// Instruction budget (wasmi fuel). Each host call costs [`Limits::call_fuel`] more.
+    /// Instruction budget (wasmi fuel). Each host call costs [`Limits::call_fuel`] more,
+    /// plus one fuel per byte copied out of or into guest memory.
     pub fuel: u64,
     pub call_fuel: u64,
     /// Linear memory cap in bytes.
@@ -74,8 +78,12 @@ pub struct Limits {
     pub max_calls: u32,
     /// Largest string passed either way (command params, results, logs).
     pub max_message: usize,
-    /// Log lines kept per run.
+    /// Log lines kept and forwarded per run. Exceeding any log limit fails the run.
     pub max_logs: usize,
+    /// Largest log line in UTF-8 bytes, also subject to [`Limits::max_message`].
+    pub max_log_line_bytes: usize,
+    /// Total log bytes kept and forwarded per run (excluding string/vector overhead).
+    pub max_log_bytes: usize,
 }
 
 impl Default for Limits {
@@ -88,6 +96,8 @@ impl Default for Limits {
             max_calls: 100_000,
             max_message: 16 * 1024 * 1024,
             max_logs: 1000,
+            max_log_line_bytes: 8 * 1024,
+            max_log_bytes: 1024 * 1024,
         }
     }
 }
@@ -118,7 +128,8 @@ pub trait Host {
     fn selection(&mut self) -> String;
     /// A message for the user.
     fn notify(&mut self, message: &str);
-    /// A line of the run's log, as the plugin writes it (it's also in [`RunOutput::logs`]).
+    /// An admitted line of the run's log (also in [`RunOutput::logs`]). Log limits apply before
+    /// this is called, including on runs that later fail.
     fn log(&mut self, _line: &str) {}
     /// The plugin's setting `key` (JSON text).
     fn setting(&mut self, _key: &str) -> Option<String> {
@@ -127,6 +138,11 @@ pub trait Host {
     /// Store (`Some`) or forget (`None`) setting `key`, or say why not.
     fn set_setting(&mut self, _key: &str, _value: Option<&str>) -> Result<(), String> {
         Err("settings aren't available here".into())
+    }
+    /// Offer the file `name` (MIME type `mime`) for saving, or say why not. The host picks the
+    /// destination; the plugin never learns it.
+    fn save_file(&mut self, _name: &str, _mime: &str, _data: &[u8]) -> Result<(), String> {
+        Err("saving files isn't available here".into())
     }
 }
 
@@ -164,6 +180,7 @@ enum Request {
     SettingGet(String),
     SettingSet(String, String),
     SettingDelete(String),
+    SaveFile(String, String, Vec<u8>),
 }
 
 struct State {
@@ -171,12 +188,19 @@ struct State {
     store_limits: StoreLimits,
     reply: Vec<u8>,
     out: RunOutput,
+    log_bytes: usize,
     /// A limit the host tripped (reported instead of the trap it causes).
     abort: Option<PluginError>,
     request: Option<Request>,
 }
 
 impl State {
+    /// Make `message` the reply and return status 1 (refused).
+    fn refuse(&mut self, message: String) -> i32 {
+        self.set_reply(message.into_bytes());
+        1
+    }
+
     /// Make `bytes` the reply; returns its length.
     fn set_reply(&mut self, bytes: Vec<u8>) -> i32 {
         let max = self.limits.max_message;
@@ -200,9 +224,7 @@ impl State {
             Request::Selection => Some(self.set_reply(host.selection().into_bytes())),
             Request::Log(line) => {
                 host.log(&line);
-                if self.out.logs.len() < self.limits.max_logs {
-                    self.out.logs.push(line);
-                }
+                self.out.logs.push(line);
                 None
             }
             Request::Notify(msg) => {
@@ -230,6 +252,13 @@ impl State {
                 let _ = host.set_setting(&key, None);
                 None
             }
+            Request::SaveFile(name, mime, data) => Some(match host.save_file(&name, &mime, &data) {
+                Ok(()) => 0,
+                Err(m) => {
+                    self.set_reply(m.into_bytes());
+                    1
+                }
+            }),
         }
     }
 }
@@ -275,10 +304,10 @@ fn compile(engine: &Engine, bytes: &[u8], limits: &Limits) -> Result<Module, Plu
         }
     }
     let export = |name: &str| module.exports().find(|e| e.name() == name).map(|e| e.ty().clone());
-    if !export("memory").is_some_and(|t| t.memory().is_some()) {
+    if export("memory").is_none_or(|t| t.memory().is_none()) {
         return Err(PluginError::InvalidModule("it doesn't export its `memory`".into()));
     }
-    if !export(ENTRY).is_some_and(|t| t.func() == Some(&func_type(1, 1))) {
+    if export(ENTRY).is_none_or(|t| t.func() != Some(&func_type(1, 1))) {
         return Err(PluginError::InvalidModule(format!("it doesn't export `{ENTRY}(input_len: i32) -> i32`")));
     }
     Ok(module)
@@ -308,7 +337,7 @@ impl Instance {
         let module = compile(&engine, bytes, limits)?;
         let store_limits =
             StoreLimitsBuilder::new().memory_size(limits.memory_bytes).memories(1).tables(4).table_elements(100_000).instances(1).build();
-        let state = State { limits: *limits, store_limits, reply: Vec::new(), out: RunOutput::default(), abort: None, request: None };
+        let state = State { limits: *limits, store_limits, reply: Vec::new(), out: RunOutput::default(), log_bytes: 0, abort: None, request: None };
         let mut store = Store::new(&engine, state);
         store.limiter(|s| &mut s.store_limits);
         store.set_fuel(limits.fuel).map_err(|e| PluginError::Trap(e.to_string()))?;
@@ -327,6 +356,7 @@ impl Instance {
         let st = self.store.data_mut();
         st.reply = input.as_bytes().to_vec();
         st.out = RunOutput::default();
+        st.log_bytes = 0;
         st.abort = None;
         st.request = None;
         self.store.set_fuel(limits.fuel).map_err(|e| PluginError::Trap(e.to_string()))?;
@@ -392,11 +422,7 @@ fn ask(caller: &mut Ctx<'_>, request: Request) -> wasmi::Error {
 /// Charge a host call: fuel and the call count.
 fn charge(caller: &mut Ctx<'_>) -> Result<(), wasmi::Error> {
     let cost = caller.data().limits.call_fuel;
-    let left = caller.get_fuel()?;
-    if left < cost {
-        return Err(abort(caller, PluginError::OutOfFuel));
-    }
-    caller.set_fuel(left - cost)?;
+    spend_fuel(caller, cost)?;
     let st = caller.data_mut();
     st.out.calls = st.out.calls.saturating_add(1);
     if st.out.calls > st.limits.max_calls {
@@ -406,12 +432,21 @@ fn charge(caller: &mut Ctx<'_>) -> Result<(), wasmi::Error> {
     Ok(())
 }
 
+/// Reserve work before copying or allocating, including when call overhead is disabled.
+fn spend_fuel(caller: &mut Ctx<'_>, cost: u64) -> Result<(), wasmi::Error> {
+    let Some(left) = caller.get_fuel()?.checked_sub(cost) else {
+        return Err(abort(caller, PluginError::OutOfFuel));
+    };
+    caller.set_fuel(left)
+}
+
 /// The bytes at `(ptr, len)` in the plugin's memory.
 fn read_bytes(caller: &mut Ctx<'_>, ptr: i32, len: i32) -> Result<Vec<u8>, wasmi::Error> {
     let (ptr, len) = (ptr as u32 as usize, len as u32 as usize);
     if len > caller.data().limits.max_message {
         return Err(abort(caller, PluginError::Limit(format!("a {len}-byte string is too long"))));
     }
+    spend_fuel(caller, len as u64)?;
     let Some(mem) = caller.get_export("memory").and_then(Extern::into_memory) else {
         return Err(abort(caller, PluginError::InvalidModule("no memory".into())));
     };
@@ -425,6 +460,28 @@ fn read_bytes(caller: &mut Ctx<'_>, ptr: i32, len: i32) -> Result<Vec<u8>, wasmi
 fn read_str(caller: &mut Ctx<'_>, ptr: i32, len: i32) -> Result<String, wasmi::Error> {
     let bytes = read_bytes(caller, ptr, len)?;
     String::from_utf8(bytes).map_err(|_| abort(caller, PluginError::Trap("a string isn't valid UTF-8".into())))
+}
+
+/// Admit a log before copying guest memory. The same budgets bound retained logs and `Host::log`,
+/// so dropping a retained line cannot leave unbounded forwarding to the host logger.
+fn read_log(caller: &mut Ctx<'_>, ptr: i32, len: i32) -> Result<String, wasmi::Error> {
+    let bytes = len as u32 as usize;
+    let limits = caller.data().limits;
+    if bytes > limits.max_log_line_bytes {
+        return Err(abort(caller, PluginError::Limit(format!("a {bytes}-byte log line is too long (limit: {} bytes)", limits.max_log_line_bytes))));
+    }
+    if caller.data().out.logs.len() >= limits.max_logs {
+        return Err(abort(caller, PluginError::Limit(format!("more than {} log lines", limits.max_logs))));
+    }
+    let total = caller
+        .data()
+        .log_bytes
+        .checked_add(bytes)
+        .filter(|total| *total <= limits.max_log_bytes)
+        .ok_or_else(|| abort(caller, PluginError::Limit(format!("more than {} log bytes", limits.max_log_bytes))))?;
+    let line = read_str(caller, ptr, len)?;
+    caller.data_mut().log_bytes = total;
+    Ok(line)
 }
 
 fn linker(engine: &Engine) -> Result<Linker<State>, PluginError> {
@@ -443,14 +500,20 @@ fn linker(engine: &Engine) -> Result<Linker<State>, PluginError> {
         Err(ask(&mut c, Request::Selection))
     })
     .map_err(err)?;
-    l.func_wrap(IMPORT_MODULE, "reply_len", |c: Ctx<'_>| -> i32 { i32::try_from(c.data().reply.len()).unwrap_or(i32::MAX) }).map_err(err)?;
+    l.func_wrap(IMPORT_MODULE, "reply_len", |mut c: Ctx<'_>| -> Result<i32, wasmi::Error> {
+        charge(&mut c)?;
+        Ok(i32::try_from(c.data().reply.len()).unwrap_or(i32::MAX))
+    })
+    .map_err(err)?;
     l.func_wrap(IMPORT_MODULE, "reply_read", |mut c: Ctx<'_>, ptr: i32, len: i32| -> Result<i32, wasmi::Error> {
+        charge(&mut c)?;
         let (ptr, want) = (ptr as u32 as usize, len as u32 as usize);
+        let n = want.min(c.data().reply.len());
+        spend_fuel(&mut c, n as u64)?;
         let Some(mem) = c.get_export("memory").and_then(Extern::into_memory) else {
             return Err(abort(&mut c, PluginError::InvalidModule("no memory".into())));
         };
         let (data, st) = mem.data_and_store_mut(&mut c);
-        let n = want.min(st.reply.len());
         let src = st.reply.get(..n).ok_or(TrapCode::MemoryOutOfBounds)?;
         let dst = ptr.checked_add(n).and_then(|end| data.get_mut(ptr..end)).ok_or(TrapCode::MemoryOutOfBounds)?;
         dst.copy_from_slice(src);
@@ -459,7 +522,7 @@ fn linker(engine: &Engine) -> Result<Linker<State>, PluginError> {
     .map_err(err)?;
     l.func_wrap(IMPORT_MODULE, "log", |mut c: Ctx<'_>, ptr: i32, len: i32| -> Result<(), wasmi::Error> {
         charge(&mut c)?;
-        let line = read_str(&mut c, ptr, len)?;
+        let line = read_log(&mut c, ptr, len)?;
         Err(ask(&mut c, Request::Log(line)))
     })
     .map_err(err)?;
@@ -471,6 +534,7 @@ fn linker(engine: &Engine) -> Result<Linker<State>, PluginError> {
     })
     .map_err(err)?;
     l.func_wrap(IMPORT_MODULE, "set_output", |mut c: Ctx<'_>, ptr: i32, len: i32| -> Result<(), wasmi::Error> {
+        charge(&mut c)?;
         let out = read_str(&mut c, ptr, len)?;
         c.data_mut().out.output = out;
         Ok(())
@@ -531,6 +595,19 @@ fn linker(engine: &Engine) -> Result<Linker<State>, PluginError> {
         charge(&mut c)?;
         let key = read_str(&mut c, kp, kl)?;
         Err(ask(&mut c, Request::SettingDelete(key)))
+    })
+    .map_err(err)?;
+    l.func_wrap(IMPORT_MODULE, "save_file", |mut c: Ctx<'_>, np: i32, nl: i32, mp: i32, ml: i32, dp: i32, dl: i32| -> Result<i32, wasmi::Error> {
+        charge(&mut c)?;
+        let name = read_str(&mut c, np, nl)?;
+        let mime = read_str(&mut c, mp, ml)?;
+        // Too much data is a refusal the plugin can handle, not a limit that fails the run.
+        let (len, max) = (dl as u32 as usize, c.data().limits.max_message);
+        if len > max {
+            return Ok(c.data_mut().refuse(format!("a file to save is limited to {max} bytes, this one has {len}")));
+        }
+        let data = read_bytes(&mut c, dp, dl)?;
+        Err(ask(&mut c, Request::SaveFile(name, mime, data)))
     })
     .map_err(err)?;
     Ok(l)

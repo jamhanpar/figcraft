@@ -196,16 +196,17 @@ fn alt_drag_shows_live_distances_to_the_neighbours() {
         e
     };
     s.pointer(&ev(PointerKind::Down, 30.0)).unwrap();
-    // Alt duplicates: the copy moves to 110..160, between the original and the other layer.
+    // Alt duplicates: the copy, dragged to 110..160, snaps to equal spacing between the original
+    // and the other layer (105..155).
     s.pointer(&ev(PointerKind::Move, 130.0)).unwrap();
     let g = s.tool.overlay.guides.clone();
     assert_eq!(
         labelled(&g),
         vec![
-            ("30".into(), [135, 0, 135, 30]),
-            ("30".into(), [135, 70, 135, 100]),
-            ("40".into(), [160, 50, 200, 50]),
-            ("50".into(), [60, 50, 110, 50])
+            ("30".into(), [130, 0, 130, 30]),
+            ("30".into(), [130, 70, 130, 100]),
+            ("45".into(), [60, 50, 105, 50]),
+            ("45".into(), [155, 50, 200, 50])
         ]
     );
     s.pointer(&ev(PointerKind::Up, 130.0)).unwrap();
@@ -248,4 +249,22 @@ fn measure_distances_command() {
     assert_eq!(out["lines"][0]["label"], json!("240"));
     assert!(s.execute("measure.distances", &json!({"ids": [f]})).is_err(), "top level: pass `to`");
     assert!(s.execute("measure.distances", &json!({"ids": [r], "to": 99999})).is_err());
+}
+
+#[test]
+fn leaving_the_canvas_clears_the_hover_measurement() {
+    let mut s = Session::new();
+    let a = rect(&mut s, 0.0, 0.0, 50.0, 50.0, None);
+    rect(&mut s, 100.0, 0.0, 50.0, 50.0, None);
+    ex(&mut s, "select.set", json!({"ids": [a]}));
+    assert!(!hover(&mut s, 125.0, 25.0, true, false, false).is_empty());
+    assert!(s.tool.overlay.measure_box.is_some());
+    s.pointer_left();
+    assert!(s.tool.overlay.guides.is_empty(), "{:?}", s.tool.overlay.guides);
+    assert_eq!(s.tool.overlay.measure_box, None);
+    // Dev Mode measures without Alt; leaving clears those too.
+    s.tool.dev_mode = true;
+    assert!(!hover(&mut s, 125.0, 25.0, false, false, false).is_empty());
+    s.pointer_left();
+    assert!(s.tool.overlay.guides.is_empty());
 }

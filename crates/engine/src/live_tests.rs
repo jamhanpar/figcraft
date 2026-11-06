@@ -28,6 +28,8 @@ pub(crate) struct Script {
     /// The session each presence in `sent` and each message in `msgs` was for.
     pub(crate) sent_to: Vec<u64>,
     pub(crate) msgs_to: Vec<u64>,
+    /// The people removed: `(session, client)`.
+    pub(crate) removed: Vec<(u64, u32)>,
 }
 
 pub(crate) struct Mock(pub(crate) Arc<Mutex<Script>>);
@@ -60,6 +62,10 @@ impl LiveLink for Mock {
         let mut s = self.0.lock().unwrap();
         s.session = session;
         s.published.push(opts);
+        Ok(())
+    }
+    fn remove(&mut self, session: u64, client: u32) -> Result<(), String> {
+        self.0.lock().unwrap().removed.push((session, client));
         Ok(())
     }
     fn leave(&mut self, session: u64) {
@@ -152,8 +158,8 @@ fn viewport(page: NodeId, x: f64, y: f64, w: f64, h: f64) -> Presence {
 #[test]
 fn without_a_link_live_sessions_are_unavailable() {
     let mut s = Session::new();
-    for cmd in ["collab.host", "collab.join"] {
-        let e = s.execute(cmd, &json!({"link": "figcraft://join?host=a:1&file=f&token=t"})).unwrap_err();
+    for (cmd, p) in [("collab.host", json!({})), ("collab.join", json!({"link": "figcraft://join?host=a:1&file=f&token=t"}))] {
+        let e = s.execute(cmd, &p).unwrap_err();
         assert!(matches!(e, EngineError::Disabled(..)), "{cmd}: {e}");
     }
     assert_eq!(s.execute("collab.leave", &json!({})).unwrap()["ended"], false);
@@ -315,6 +321,43 @@ fn the_host_ending_resets_everything() {
 }
 
 #[test]
+fn the_host_removes_people_and_guests_cant() {
+    let (mut s, script) = session();
+    let remove = |s: &mut Session, client: serde_json::Value| s.execute("collab.removePerson", &json!({ "client": client }));
+    // Not in a session: nobody to remove.
+    assert!(matches!(remove(&mut s, json!(2)), Err(EngineError::BadParams { .. })));
+    assert!(!crate::live::can_remove_people(&s));
+    s.execute("collab.host", &json!({})).unwrap();
+    let id = s.live().id;
+    push(&script, vec![Event::PeerJoined(peer(2, "Ada")), Event::PeerJoined(peer(3, "Bo"))]);
+    s.live_poll();
+    assert!(crate::live::can_remove_people(&s));
+    // Only someone who is here, by a client id.
+    for bad in [json!(9), json!(1), json!(-2), json!("2"), json!(4_294_967_296u64)] {
+        assert!(matches!(remove(&mut s, bad.clone()), Err(EngineError::BadParams { .. })), "{bad}");
+    }
+    let r = remove(&mut s, json!(2)).unwrap();
+    assert_eq!((r["removed"].as_u64(), r["name"].as_str()), (Some(2), Some("Ada")));
+    assert_eq!(script.lock().unwrap().removed, [(id, 2)]);
+    assert_eq!(s.message.as_deref(), Some("Ada was removed from the session"));
+    // The host's own session tells them she left.
+    push(&script, vec![Event::PeerLeft(2)]);
+    s.live_poll();
+    assert_eq!(s.live().peers.keys().copied().collect::<Vec<_>>(), [3]);
+    s.execute("collab.stop", &json!({})).unwrap();
+
+    // A guest in someone else's session can't remove anyone.
+    let (mut s, script) = session();
+    s.execute("collab.join", &json!({"link": "figcraft://join?host=a:1&file=f&token=t"})).unwrap();
+    push(&script, vec![Event::Welcome { info: info(Role::Guest, 2), peers: vec![peer(1, "Hana"), peer(3, "Bo")] }]);
+    s.live_poll();
+    assert!(!crate::live::can_remove_people(&s));
+    let e = remove(&mut s, json!(3)).unwrap_err().to_string();
+    assert!(e.contains("only the person hosting"), "{e}");
+    assert!(script.lock().unwrap().removed.is_empty());
+}
+
+#[test]
 fn collab_commands_survive_junk() {
     let junk = [
         json!(null),
@@ -463,4 +506,12 @@ fn hosting_commands_check_what_they_are_given() {
     let e = s.execute("collab.report", &json!({"reason": "Spam"})).unwrap_err().to_string();
     assert!(e.contains("join a file"), "{e}");
     assert!(s.execute("collab.report", &json!({"reason": " \n "})).unwrap_err().to_string().contains("few words"));
+}
+
+#[test]
+fn parse_color_rejects_signs_and_non_hex() {
+    use crate::live::parse_color;
+    assert_eq!(parse_color("#+1+2+3"), None);
+    assert_eq!(parse_color("#-1-2-3"), None);
+    assert_eq!(parse_color("#0D99FF"), Some((13, 153, 255)));
 }

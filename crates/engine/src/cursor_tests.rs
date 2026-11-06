@@ -58,6 +58,9 @@ fn close(a: f64, b: f64) -> bool {
 
 /// A square (100,100)–(200,200), selected, and the text "Hello" at (400, 100), not selected.
 fn scene() -> (Session, NodeId, NodeId) {
+    // The text is measured with a font: without craft-fonts that is a system one, scanned here
+    // rather than by whichever test happens to run first (#333).
+    figcraft_text::scan_system_fonts();
     let mut s = Session::new();
     let r = id(&ex(&mut s, "shape.rectangle", json!({"x": 100, "y": 100, "width": 100, "height": 100})));
     let t = id(&ex(&mut s, "text.create", json!({"text": "Hello", "x": 400, "y": 100, "props": {"fontSize": 40}})));
@@ -67,6 +70,7 @@ fn scene() -> (Session, NodeId, NodeId) {
 
 const EMPTY: (f64, f64) = (700.0, 600.0);
 const ON_SQUARE: (f64, f64) = (150.0, 150.0);
+const ON_SQUARE_EDGE: (f64, f64) = (101.0, 150.0);
 const ON_TEXT: (f64, f64) = (420.0, 120.0);
 
 #[test]
@@ -98,6 +102,9 @@ fn each_tool_has_its_cursor_by_modifier_and_what_is_under_the_pointer() {
         (ToolId::Text, NONE, EMPTY, Crosshair, "the Text tool makes a text where it is pressed"),
         (ToolId::Text, NONE, ON_SQUARE, Crosshair, "over a shape too"),
         (ToolId::Text, NONE, ON_TEXT, Text, "the I-beam over a text: a click edits it there"),
+        (ToolId::TextOnPath, NONE, EMPTY, Default, "text on a path: a click on empty canvas does nothing"),
+        (ToolId::TextOnPath, NONE, ON_SQUARE, Default, "nor inside a shape, away from its path"),
+        (ToolId::TextOnPath, NONE, ON_SQUARE_EDGE, Text, "the I-beam over a shape's path: a click puts text on it"),
         (ToolId::Pen, NONE, EMPTY, Pen(PenCursor::New), "the pen: a new point"),
         (ToolId::Comment, NONE, EMPTY, Comment, "the comment pin"),
         (ToolId::Eyedropper, NONE, ON_SQUARE, Eyedropper, "the eyedropper"),
@@ -199,21 +206,40 @@ fn an_edit_an_instance_refuses_shows_not_allowed_and_is_undone() {
     let before = s.doc().unwrap().world_bounds(inner).unwrap();
     assert_eq!((before.x0, before.y0, before.x1, before.y1), (450.0, 50.0, 550.0, 150.0));
     ex(&mut s, "select.set", json!({"ids": [inner]}));
-    // Resizing it by its right edge: only the main component can.
-    assert!(close(resize(hover(&mut s, (550.0, 100.0), NONE)), 0.0), "the handle still shows its arrow");
+    // Resizing it by its right edge: a size of its own (an override).
+    assert!(close(resize(hover(&mut s, (550.0, 100.0), NONE)), 0.0), "the handle shows its arrow");
     s.pointer(&ev(PointerKind::Down, (550.0, 100.0), NONE)).unwrap();
     s.pointer(&ev(PointerKind::Move, (570.0, 100.0), NONE)).unwrap();
     s.pointer(&ev(PointerKind::Move, (600.0, 100.0), NONE)).unwrap();
-    assert_eq!(s.tool.overlay.cursor, Cursor::NotAllowed);
+    assert_ne!(s.tool.overlay.cursor, Cursor::NotAllowed);
     s.pointer(&ev(PointerKind::Up, (600.0, 100.0), NONE)).unwrap();
-    assert_eq!(s.doc().unwrap().world_bounds(inner).unwrap(), before, "the resize was undone");
-    // Moving it: refused too.
+    let before = s.doc().unwrap().world_bounds(inner).unwrap();
+    assert_eq!((before.x0, before.x1), (450.0, 600.0), "the resize stays");
+    // Moving it: only the main component can.
     s.pointer(&ev(PointerKind::Down, (500.0, 100.0), NONE)).unwrap();
     s.pointer(&ev(PointerKind::Move, (510.0, 110.0), NONE)).unwrap();
     s.pointer(&ev(PointerKind::Move, (520.0, 120.0), NONE)).unwrap();
     assert_eq!(s.tool.overlay.cursor, Cursor::NotAllowed);
     s.pointer(&ev(PointerKind::Up, (520.0, 120.0), NONE)).unwrap();
     assert_eq!(s.doc().unwrap().world_bounds(inner).unwrap(), before, "the move was undone");
+}
+
+#[test]
+fn a_pen_click_that_wobbles_a_pixel_is_still_a_click() {
+    let mut s = Session::new();
+    s.set_tool(ToolId::Pen);
+    // A real click: the mouse moves a pixel or two between press and release.
+    s.pointer(&ev(PointerKind::Down, (100.0, 100.0), NONE)).unwrap();
+    s.pointer(&ev(PointerKind::Move, (102.0, 101.0), NONE)).unwrap();
+    s.pointer(&ev(PointerKind::Up, (102.0, 101.0), NONE)).unwrap();
+    let out = s.tool.pen.as_ref().and_then(|p| p.points.first()).map(|(_, _, o)| *o);
+    assert_eq!(out.map(|o| o.hypot()), Some(0.0), "no handle pulled out");
+    assert!(s.tool.overlay.pen_handles.is_empty());
+    // Past the slop it is a drag: the handle follows the pointer from where it was pressed.
+    s.pointer(&ev(PointerKind::Down, (200.0, 100.0), NONE)).unwrap();
+    s.pointer(&ev(PointerKind::Move, (204.0, 100.0), NONE)).unwrap();
+    let out = s.tool.pen.as_ref().and_then(|p| p.points.last()).map(|(_, _, o)| (o.x, o.y));
+    assert_eq!(out, Some((4.0, 0.0)));
 }
 
 #[test]
@@ -248,13 +274,14 @@ fn vector_edit_mode_shows_each_tool_and_modifier() {
     let mut s = Session::new();
     let path = id(&ex(&mut s, "vector.create", json!({"points": [[100, 100], [300, 100], [300, 300]], "closed": false})));
     ex(&mut s, "vector.edit.begin", json!({"id": path}));
-    let (point, segment, empty) = ((300.0, 100.0), (200.0, 100.0), (200.0, 250.0));
+    let (point, segment, midpoint, empty) = ((300.0, 100.0), (150.0, 100.0), (200.0, 100.0), (200.0, 250.0));
     use Cursor::*;
     // (vector tool, modifiers, where, cursor, why)
     type Row = (&'static str, Mods, (f64, f64), Cursor, &'static str);
     let rows: Vec<Row> = vec![
         ("move", NONE, point, Default, "the arrow over a point"),
         ("move", NONE, segment, Default, "the arrow over a segment"),
+        ("move", NONE, midpoint, Pen(PenCursor::Add), "the arrow over a segment's midpoint: adds a point there"),
         ("move", NONE, empty, Default, "the arrow elsewhere"),
         ("move", ALT, segment, Pen(PenCursor::Add), "Alt over a segment adds a point there"),
         ("move", ALT, point, Default, "Alt over a point adds nothing"),

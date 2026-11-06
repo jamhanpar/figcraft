@@ -60,6 +60,9 @@ impl LetterSpacing {
 }
 
 pub fn trim_num(v: f64) -> String {
+    if v.abs() >= 9.0e18 {
+        return format!("{v}");
+    }
     let r = (v * 100.0).round() / 100.0;
     if r.fract().abs() < 1e-9 { format!("{}", r as i64) } else { format!("{r}") }
 }
@@ -117,23 +120,44 @@ impl TextCase {
     }
 
     /// Apply the case to `s`, which follows `prev` in the text (so title case only capitalises
-    /// the first letter of each word even when a word spans several styled runs).
+    /// the first letter of each word even when a word spans several styled runs). An apostrophe
+    /// as `prev` is taken to continue a word.
     pub fn apply_after(self, s: &str, prev: Option<char>) -> String {
+        self.apply_impl(s, prev, prev.is_some_and(is_word_char))
+    }
+
+    /// Like [`apply_after`](Self::apply_after), also given the char `before` `prev`: an apostrophe
+    /// only continues a word when a letter or digit precedes it.
+    pub fn apply_between(self, s: &str, before: Option<char>, prev: Option<char>) -> String {
+        let continues = prev.is_some_and(|c| is_word_char(c) && (c.is_alphanumeric() || before.is_some_and(char::is_alphanumeric)));
+        self.apply_impl(s, prev, continues)
+    }
+
+    /// `in_word` says whether `prev` continues a word (rather than a new word starting here).
+    fn apply_impl(self, s: &str, prev: Option<char>, in_word: bool) -> String {
         match self {
             TextCase::Original | TextCase::SmallCaps => s.to_string(),
             TextCase::Upper => s.to_uppercase(),
             TextCase::Lower => s.to_lowercase(),
             TextCase::Title => {
                 let mut out = String::with_capacity(s.len());
-                let mut start = prev.is_none_or(|c| !is_word_char(c));
+                let mut start = !in_word;
+                let mut last = prev;
                 for ch in s.chars() {
                     if start && ch.is_alphanumeric() {
                         out.extend(ch.to_uppercase());
                         start = false;
                     } else {
                         out.push(ch);
-                        start = !is_word_char(ch);
+                        // An apostrophe only continues a word right after a letter or digit.
+                        let opening_apostrophe =
+                            matches!(ch, '\'' | '\u{2019}') && !last.is_some_and(|c| c.is_alphanumeric() || is_combining_mark(c));
+                        // A combining mark attaches to the char before it and never changes word state.
+                        if !is_combining_mark(ch) {
+                            start = !is_word_char(ch) || opening_apostrophe;
+                        }
                     }
+                    last = Some(ch);
                 }
                 out
             }
@@ -146,9 +170,23 @@ impl TextCase {
     }
 }
 
-/// Letters, digits and apostrophes continue a word (so "don't" stays "Don't").
+/// Letters, digits, combining marks and apostrophes continue a word (so "don't" stays "Don't"
+/// and decomposed accents stay inside their word).
 fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '\'' | '\u{2019}')
+    c.is_alphanumeric() || is_combining_mark(c) || matches!(c, '\'' | '\u{2019}')
+}
+
+/// Combining marks such as the U+0301 accent in decomposed text: non-alphanumeric chars that
+/// extend the grapheme of the char before them.
+fn is_combining_mark(c: char) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    if c.is_ascii() || c.is_alphanumeric() {
+        return false;
+    }
+    let mut buf = [0u8; 8];
+    buf[0] = b'a';
+    let end = 1 + c.encode_utf8(&mut buf[1..]).len();
+    std::str::from_utf8(&buf[..end]).is_ok_and(|s| s.graphemes(true).count() == 1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -196,6 +234,22 @@ pub enum LeadingTrim {
     CapHeight,
 }
 
+/// Where lines break when text wraps to more than one line ("Wrap style controls where lines
+/// break when text wraps to more than one line", Explore text properties).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum WrapStyle {
+    /// "Figma fits as many words as possible on each line before wrapping to the next."
+    #[default]
+    Auto,
+    /// "Figma distributes text as evenly as possible across every line, so each line is close to
+    /// the same length."
+    Balance,
+    /// "Figma keeps each line full, but adjusts the last four lines to avoid an orphan -- a single
+    /// word stranded alone on the last line."
+    Pretty,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum ListStyle {
@@ -213,8 +267,15 @@ pub const MAX_LIST_INDENT: u8 = 8;
 #[serde(default)]
 pub struct ParaList {
     pub list: ListStyle,
-    /// Nesting level (0 = outermost; plain paragraphs are always 0).
+    /// Nesting level (0 = outermost). A plain paragraph is 0, except one that left its list by
+    /// Backspace or Delete at its start ([`TextData::unlist_keeping_levels`]): it keeps the level
+    /// it had and starts where that level's item text does ("delete the counter, but keep the
+    /// same level of indentation").
     pub indent: u8,
+    /// A numbered list that starts counting at this paragraph counts from `start_offset + 1`
+    /// (items that go on counting ignore it; other paragraphs are always 0).
+    #[serde(skip_serializing_if = "crate::node::is_default")]
+    pub start_offset: u32,
 }
 
 /// Character style. In runs, every field is an override; `None` means "inherit the base".
@@ -246,10 +307,17 @@ pub struct TextStyle {
     pub style_id: Option<String>,
 }
 
+/// The font new text starts in. A build can name another (`FIGCRAFT_DEFAULT_FONT="Noto Sans Thai"`,
+/// for a distribution whose users mostly write a script Inter lacks); empty means Inter.
+pub const DEFAULT_FONT: &str = match option_env!("FIGCRAFT_DEFAULT_FONT") {
+    Some(family) if !family.is_empty() => family,
+    _ => "Inter",
+};
+
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
-            font_family: "Inter".into(),
+            font_family: DEFAULT_FONT.into(),
             font_style: "Regular".into(),
             font_size: 12.0,
             line_height: LineHeight::Auto,
@@ -330,6 +398,13 @@ impl TextStyle {
 /// Weight from a style name ("Semi Bold Italic" → 600).
 pub fn style_weight(style: &str) -> u16 {
     let s = style.to_ascii_lowercase().replace([' ', '-'], "");
+    // A weight number ("600", "600 Italic"), as some apps name styles.
+    let digits: String = s.chars().take_while(char::is_ascii_digit).collect();
+    if let Ok(n) = digits.parse::<u16>()
+        && (1..=1000).contains(&n)
+    {
+        return n;
+    }
     let table: [(&str, u16); 10] = [
         ("thin", 100),
         ("extralight", 200),
@@ -403,9 +478,14 @@ pub struct TextData {
     /// line's baseline).
     #[serde(skip_serializing_if = "crate::node::is_default")]
     pub leading_trim: LeadingTrim,
-    /// Max lines when truncating (0 = as many as fit).
+    /// Max lines when truncating, or before an auto-height text ends in an ellipsis (0 = as many
+    /// as fit).
     #[serde(skip_serializing_if = "crate::node::is_default")]
     pub max_lines: u32,
+    /// Where lines break when the text wraps: greedily (Auto), as evenly as the words allow
+    /// (Balance), or full with no one word alone on the last line (Pretty).
+    #[serde(skip_serializing_if = "crate::node::is_default")]
+    pub wrap_style: WrapStyle,
     /// OpenType feature toggles (e.g. "liga": false).
     #[serde(skip_serializing_if = "crate::node::is_default")]
     pub features: std::collections::BTreeMap<String, bool>,
@@ -413,6 +493,21 @@ pub struct TextData {
     /// data small.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<Box<TextPath>>,
+    /// Where the file this text came from wrapped its lines (an imported `.fig`'s saved layout).
+    /// Layout follows them only while the box width and everything that moves a line break are
+    /// as they were saved, so an edit that could change the wrap drops them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_breaks: Option<Box<SavedBreaks>>,
+}
+
+/// Line breaks a file saved with a text: the chars that start a wrapped line (not those after a
+/// hard break), for the box width and the content ([`TextData::layout_key`]) they were made for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SavedBreaks {
+    pub starts: Vec<usize>,
+    pub width: f64,
+    pub for_text: u64,
 }
 
 /// Text on a path: the baseline follows `d`. The text starts at `start` (aligned there by the
@@ -471,6 +566,43 @@ impl TextData {
         Self { characters: characters.into(), ..Default::default() }
     }
 
+    /// A stable hash of what decides where lines break: everything but paints, links, style links,
+    /// decorations, vertical settings and the saved breaks themselves (FNV-1a over the JSON, so it
+    /// stays the same across builds and can be saved).
+    pub fn layout_key(&self) -> u64 {
+        let clear = |s: &mut TextStyle| {
+            (s.fills, s.link, s.style_id, s.decoration, s.decoration_look) = (None, None, None, TextDecoration::None, None);
+        };
+        let mut t = TextData {
+            align_v: TextAlignV::default(),
+            paragraph_spacing: 0.0,
+            list_spacing: 0.0,
+            leading_trim: LeadingTrim::default(),
+            max_lines: 0,
+            saved_breaks: None,
+            ..self.clone()
+        };
+        clear(&mut t.style);
+        t.runs.iter_mut().for_each(|r| clear(&mut r.style));
+        t.normalize();
+        serde_json::to_vec(&t).unwrap_or_default().iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// Keep `starts` (chars that start a wrapped line) as this text's saved line breaks in a box
+    /// `width` wide.
+    pub fn save_breaks(&mut self, starts: Vec<usize>, width: f64) {
+        self.saved_breaks = Some(Box::new(SavedBreaks { starts, width, for_text: self.layout_key() }));
+    }
+
+    /// The saved line starts (empty: no wrapped line) while they still hold: the same box width and
+    /// layout content, and starts increasing inside the text.
+    pub fn saved_breaks_for(&self, width: f64) -> Option<&[usize]> {
+        let b = self.saved_breaks.as_deref()?;
+        let inside = b.starts.first().is_none_or(|s| *s > 0) && b.starts.last().is_none_or(|s| *s < self.char_count());
+        let same_box = (b.width - width).abs() <= 1e-6 * width.abs().max(1.0);
+        (inside && same_box && b.starts.is_sorted_by(|a, b| a < b) && b.for_text == self.layout_key()).then_some(b.starts.as_slice())
+    }
+
     /// How far text on a path paints past its path's box (glyphs stand on the path, lines after
     /// the first run beside it): about one and a half of the largest size per line; 0 off a path.
     pub fn path_reach(&self) -> f64 {
@@ -494,6 +626,30 @@ impl TextData {
 
     pub fn char_count(&self) -> usize {
         self.characters.chars().count()
+    }
+
+    /// Whether text that runs out of room ends in an ellipsis: a truncating box, or auto height
+    /// or auto width with a line limit (the box hugs up to `max_lines` lines: "Max lines is
+    /// available only if truncate text is enabled, and: Text resizing is set to auto height or
+    /// auto width").
+    pub fn truncates(&self) -> bool {
+        match self.auto_resize {
+            TextAutoResize::Truncate => true,
+            TextAutoResize::Height | TextAutoResize::WidthAndHeight => self.max_lines > 0,
+            TextAutoResize::None => false,
+        }
+    }
+
+    /// The resize mode once the box is given an explicit `width` and/or `height`: an explicit
+    /// height fixes the box, an explicit width turns auto width into auto height, and truncating
+    /// text keeps truncating.
+    pub fn fix_size(&mut self, width: bool, height: bool) {
+        self.auto_resize = match self.auto_resize {
+            _ if height && self.truncates() => TextAutoResize::Truncate,
+            _ if height => TextAutoResize::None,
+            TextAutoResize::WidthAndHeight if width => TextAutoResize::Height,
+            mode => mode,
+        };
     }
 
     /// The style at char index `i`.
@@ -562,7 +718,7 @@ impl TextData {
         }
     }
 
-    /// Drop empty/out-of-range runs and runs equal to the base style.
+    /// Drop empty/out-of-range runs and runs equal to the base style, and merge touching equal runs.
     pub fn normalize(&mut self) {
         let n = self.char_count();
         let base = self.style.clone();
@@ -571,6 +727,21 @@ impl TextData {
             r.end = r.end.min(n);
         }
         self.runs.sort_by_key(|r| r.start);
+        let mut merged: Vec<StyleRun> = Vec::with_capacity(self.runs.len());
+        for mut r in std::mem::take(&mut self.runs) {
+            // Runs never overlap: a later run starts where the previous one ends at the earliest.
+            if let Some(prev) = merged.last() {
+                r.start = r.start.max(prev.end);
+                if r.start >= r.end {
+                    continue;
+                }
+            }
+            match merged.last_mut() {
+                Some(prev) if prev.end == r.start && prev.style == r.style => prev.end = r.end,
+                _ => merged.push(r),
+            }
+        }
+        self.runs = merged;
     }
 
     /// Replace chars `start..end` with `text`, shifting runs (inserted text takes the style at `start`).
@@ -602,7 +773,9 @@ impl TextData {
                 if p <= start {
                     p
                 } else if p >= end {
-                    p - removed + inserted
+                    // Runs of a file that reach past the text (nothing clamps them on load)
+                    // would otherwise overflow here; `normalize` below drops what is left.
+                    p.saturating_sub(removed).saturating_add(inserted)
                 } else {
                     start + inserted
                 }
@@ -627,13 +800,13 @@ impl TextData {
 
     /// Paragraph `p`'s list settings.
     pub fn para_list(&self, p: usize) -> ParaList {
-        self.paragraphs.get(p).copied().unwrap_or(ParaList { list: self.list, indent: 0 })
+        self.paragraphs.get(p).copied().unwrap_or(ParaList { list: self.list, ..ParaList::default() })
     }
 
     /// Spell out every paragraph's list settings in `paragraphs` (and drop extra entries).
     fn fill_paragraphs(&mut self) {
         let n = self.paragraph_count();
-        let fill = ParaList { list: self.list, indent: 0 };
+        let fill = ParaList { list: self.list, ..ParaList::default() };
         self.paragraphs.resize(n, fill);
     }
 
@@ -647,17 +820,34 @@ impl TextData {
     }
 
     /// Apply `f` to the list settings of the paragraphs chars `start..end` touch (plain
-    /// paragraphs stay at level 0, levels stop at [`MAX_LIST_INDENT`]); one style for all with
-    /// no nesting folds back into `list`.
+    /// paragraphs stay at level 0, only numbered ones keep a start, levels stop at
+    /// [`MAX_LIST_INDENT`]); one style for all with no nesting or start folds back into `list`.
     pub fn set_para_lists(&mut self, start: usize, end: usize, f: impl Fn(&mut ParaList)) {
+        self.set_para_lists_with(start, end, false, f);
+    }
+
+    /// Take the list items among the paragraphs chars `start..end` touch out of their list at the
+    /// level they had, as Backspace or Delete at an item's start does: "delete the counter, but
+    /// keep the same level of indentation" (Create bulleted and numbered lists).
+    pub fn unlist_keeping_levels(&mut self, start: usize, end: usize) {
+        self.set_para_lists_with(start, end, true, |pl| pl.list = ListStyle::None);
+    }
+
+    fn set_para_lists_with(&mut self, start: usize, end: usize, keep_levels: bool, f: impl Fn(&mut ParaList)) {
         let (a, b) = self.para_span(start, end);
         self.fill_paragraphs();
         for pl in self.paragraphs.get_mut(a..=b).unwrap_or(&mut []) {
             f(pl);
-            pl.indent = if pl.list == ListStyle::None { 0 } else { pl.indent.min(MAX_LIST_INDENT) };
+            if pl.list == ListStyle::None && !keep_levels {
+                pl.indent = 0;
+            }
+            if pl.list != ListStyle::Numbered {
+                pl.start_offset = 0;
+            }
+            pl.indent = pl.indent.min(MAX_LIST_INDENT);
         }
         if let Some(first) = self.paragraphs.first().copied()
-            && first.indent == 0
+            && first == (ParaList { list: first.list, ..ParaList::default() })
             && self.paragraphs.iter().all(|p| *p == first)
         {
             self.list = first.list;
@@ -665,21 +855,24 @@ impl TextData {
         }
     }
 
-    /// The list settings shared by the paragraphs chars `start..end` touch, or None when they differ.
+    /// The list style and level shared by the paragraphs chars `start..end` touch (the first
+    /// one's settings), or None when they differ. Start numbers don't count.
     pub fn common_para_list(&self, start: usize, end: usize) -> Option<ParaList> {
         let (a, b) = self.para_span(start, end);
         let first = self.para_list(a);
-        (a..=b).all(|p| self.para_list(p) == first).then_some(first)
+        (a..=b).all(|p| self.para_list(p).list == first.list && self.para_list(p).indent == first.indent).then_some(first)
     }
 
     /// Link chars `start..end` (all of them when the range is empty or the whole text) to text
     /// style `id`, defined as `def`.
     pub fn link_text_style(&mut self, start: usize, end: usize, def: &TextStyle, id: &str) {
+        let (start, end) = if start == end { (0, self.char_count()) } else { (start, end) };
         self.restyle(start, end, |s| s.take_text_style(def, id));
     }
 
     /// Unlink chars `start..end` (all when empty or whole) from their text styles; values stay.
     pub fn unlink_text_style(&mut self, start: usize, end: usize) {
+        let (start, end) = if start == end { (0, self.char_count()) } else { (start, end) };
         self.restyle(start, end, |s| s.style_id = None);
     }
 
@@ -738,6 +931,15 @@ mod case_tests {
     use super::*;
 
     #[test]
+    fn trim_num_prints_huge_whole_numbers() {
+        assert_eq!(trim_num(1e19), "10000000000000000000");
+        assert_eq!(trim_num(-1e19), "-10000000000000000000");
+        assert_eq!(trim_num(12.0), "12");
+        let v = 12345678901234567890.0_f64;
+        assert_eq!(trim_num(v).parse::<f64>().unwrap(), v);
+    }
+
+    #[test]
     fn title_case_respects_context() {
         assert_eq!(TextCase::Title.apply("hello wORLD don't 3d x-ray"), "Hello WORLD Don't 3d X-Ray");
         // Continuing a word from a previous run: no capital.
@@ -746,6 +948,18 @@ mod case_tests {
         assert_eq!(TextCase::Upper.apply_after("ß", Some('a')), "SS");
         assert!(valid_feature_tag("liga") && valid_feature_tag("ss01"));
         assert!(!valid_feature_tag("lig") && !valid_feature_tag("ligatures") && !valid_feature_tag("li\u{e9}"));
+    }
+
+    #[test]
+    fn new_text_starts_in_the_builds_default_font() {
+        // Inter, unless the build names another with `FIGCRAFT_DEFAULT_FONT` (empty means Inter).
+        let named = option_env!("FIGCRAFT_DEFAULT_FONT").filter(|f| !f.is_empty());
+        assert_eq!(DEFAULT_FONT, named.unwrap_or("Inter"));
+        let st = TextStyle::default();
+        assert_eq!(st.font_family, DEFAULT_FONT);
+        // The family is always written, so a saved file keeps it in a build with another default.
+        let saved = serde_json::to_value(&st).unwrap();
+        assert_eq!(saved["font_family"], DEFAULT_FONT);
     }
 
     #[test]
@@ -769,5 +983,59 @@ mod case_tests {
         assert_eq!(st.weight(), 700);
         assert_eq!(st.variations.keys().collect::<Vec<_>>(), ["wdth"]);
         assert!(valid_axis_tag("wght") && !valid_axis_tag("weight"));
+    }
+
+    #[test]
+    fn list_starts_load_from_old_files_and_follow_edits() {
+        use ListStyle::{Bulleted as B, None as P, Numbered as N};
+        // Files written before start numbers load with none, and write the same bytes.
+        let old = r#"{"list":"numbered","indent":1}"#;
+        let pl: ParaList = serde_json::from_str(old).unwrap();
+        assert_eq!(pl, ParaList { list: N, indent: 1, start_offset: 0 });
+        assert_eq!(serde_json::to_string(&pl).unwrap(), old);
+        // One numbered paragraph with a start keeps it (it doesn't fold into `list`).
+        let mut t = TextData { characters: "Next".into(), ..Default::default() };
+        t.set_para_lists(0, 0, |p| *p = ParaList { list: N, indent: 0, start_offset: 1 });
+        assert_eq!(t.para_list(0), ParaList { list: N, indent: 0, start_offset: 1 });
+        // Enter copies it to the new item; different starts don't make the list mixed.
+        t.replace_range(4, 4, "\nMore");
+        assert_eq!(t.para_list(1).start_offset, 1);
+        t.set_para_lists(5, 5, |p| p.start_offset = 0);
+        assert!(t.common_para_list(0, t.char_count()).is_some_and(|p| p.list == N));
+        // Bullets have no number, so no start.
+        t.set_para_lists(0, 0, |p| *p = ParaList { list: B, indent: 1, start_offset: 4 });
+        assert_eq!(t.para_list(0), ParaList { list: B, indent: 1, start_offset: 0 });
+        // A plain paragraph has none.
+        t.set_para_lists(0, 0, |p| p.list = P);
+        assert_eq!(t.para_list(0), ParaList::default());
+    }
+}
+
+#[cfg(test)]
+mod title_case_tests {
+    use super::TextCase;
+
+    #[test]
+    fn title_case_after_opening_apostrophe() {
+        assert_eq!(TextCase::Title.apply("'hello world'"), "'Hello World'");
+        assert_eq!(TextCase::Title.apply("say 'hi'"), "Say 'Hi'");
+        assert_eq!(TextCase::Title.apply("don't"), "Don't");
+        assert_eq!(TextCase::Title.apply("\u{2019}hello"), "\u{2019}Hello");
+    }
+
+    #[test]
+    fn title_case_between_runs_sees_char_before_apostrophe() {
+        assert_eq!(TextCase::Title.apply_after("t", Some('\'')), "t");
+        assert_eq!(TextCase::Title.apply_between("hello", None, Some('\'')), "Hello");
+        assert_eq!(TextCase::Title.apply_between("t", Some('n'), Some('\'')), "t");
+        assert_eq!(TextCase::Title.apply_between("t", Some(' '), Some('\u{2019}')), "T");
+    }
+
+    #[test]
+    fn title_case_combining_marks_do_not_break_words() {
+        assert_eq!(TextCase::Title.apply("re\u{301}sume\u{301}"), "Re\u{301}sume\u{301}");
+        assert_eq!(TextCase::Title.apply("re\u{301}sume\u{301} bon"), "Re\u{301}sume\u{301} Bon");
+        assert_eq!(TextCase::Title.apply("a \u{301}b"), "A \u{301}B");
+        assert_eq!(TextCase::Title.apply("cafe\u{301}'s"), "Cafe\u{301}'s");
     }
 }
