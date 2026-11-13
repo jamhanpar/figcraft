@@ -16,7 +16,7 @@ use crate::{Result, bad};
 pub const STROKE_SIDES: [&str; 4] = ["strokeTopWeight", "strokeRightWeight", "strokeBottomWeight", "strokeLeftWeight"];
 
 /// Keys `node.set` understands (documented for agents).
-pub const KEYS: &str = "name, visible, locked, opacity (0-1 or \"50%\"), blend, x, y (relative to the parent frame; groups don't count), width, height, rotation (degrees), \
+pub const KEYS: &str = "name, visible, locked, opacity (0-1 or \"50%\"), blend, x, y (relative to the parent frame; groups don't count), width, height, rotation (degrees), absoluteRotation (degrees on the page: the layer's angle plus its parents', what the Design panel's field shows; one of the two per call), \
 fills (paints or colours; gradients as {type: linearGradient|radialGradient|angularGradient|diamondGradient, stops: [\"#hex\", ...], from?, to?} too), fill (colour, {$var: variable id or name}, or \"none\"/null: no fill), strokes, stroke (colour, {$var: variable id or name}, or \"none\"/null: no stroke), strokeWeight, strokeAlign (inside|center|outside), strokeSides [t,r,b,l], strokeTopWeight / strokeRightWeight / strokeBottomWeight / strokeLeftWeight (one side; turns on individual strokes), \
 strokeCap / startCap / endCap, strokeJoin, miterAngle (degrees: sharper joins bevel; or miterLimit as a ratio), dashes [..], dashCap (none|round|square; null: dashes take startCap and endCap), widthProfile (preset uniform|wedge|taper|eye|rounded|pinch, [[t, scale], ...] or null), brush (preset id, {preset, spacing, sizeJitter, rotationJitter, scatter, seed} or null), cornerRadius (n or [tl,tr,br,bl]), cornerSmoothing (0-1), effects, \
 clip, isMask, layout (null|horizontal|vertical|grid|{...}), gap, crossGap, padding (n or [t,r,b,l]), paddingTop/Right/Bottom/Left, \
@@ -456,7 +456,7 @@ fn apply_order(k: &str, v: &Value) -> u8 {
     match k {
         "path" | "width" | "height" | "w" | "h" => 0,
         "layout" | "layoutMode" => 1,
-        "rotation" => 3,
+        "rotation" | "absoluteRotation" => 3,
         "x" | "y" => 4,
         "fillStyle" | "strokeStyle" | "effectStyle" | "textStyle" | "gridStyle" => 5,
         "boundVariables" => 6,
@@ -595,6 +595,27 @@ fn apply_geometry(
             let n = doc.get_mut(id)?;
             n.transform = figcraft_geom::set_rotation_about_center(n.transform, n.width, n.height, deg);
         }
+        "absoluteRotation" => {
+            let deg = f64_of(v).ok_or_else(|| bad(cmd, "`absoluteRotation` must be degrees"))?;
+            if props.contains_key("rotation") {
+                return Err(bad(cmd, "give one of `rotation` and `absoluteRotation`"));
+            }
+            let (w, h) = {
+                let n = doc.get(id)?;
+                (n.width, n.height)
+            };
+            let world = figcraft_geom::set_rotation_about_center(doc.world_transform(id), w, h, deg);
+            let parent = doc.get(id)?.parent;
+            let pw = parent.map(|p| doc.world_transform(p)).unwrap_or(figcraft_geom::Affine::IDENTITY);
+            let local = pw.inverse() * world;
+            if local.as_coeffs().iter().all(|c| c.is_finite()) {
+                doc.get_mut(id)?.transform = local;
+            } else {
+                // A degenerate parent can't be inverted: turn the local angle instead.
+                let n = doc.get_mut(id)?;
+                n.transform = figcraft_geom::set_rotation_about_center(n.transform, n.width, n.height, deg);
+            }
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -657,7 +678,7 @@ fn apply_look(cmd: &str, doc: &mut Document, id: NodeId, k: &str, v: &Value) -> 
         "startCap" => doc.get_mut(id)?.stroke.cap_start = enum_of(v).ok_or_else(|| bad(cmd, format!("startCap: {STROKE_CAP_HELP}")))?,
         "endCap" => doc.get_mut(id)?.stroke.cap_end = enum_of(v).ok_or_else(|| bad(cmd, format!("endCap: {STROKE_CAP_HELP}")))?,
         "strokeJoin" => doc.get_mut(id)?.stroke.join = enum_of(v).ok_or_else(|| bad(cmd, "strokeJoin: miter|bevel|round"))?,
-        "miterLimit" => doc.get_mut(id)?.stroke.miter_limit = f64_of(v).unwrap_or(4.0).clamp(1.0, 100.0),
+        "miterLimit" => doc.get_mut(id)?.stroke.miter_limit = f64_of(v).ok_or_else(|| bad(cmd, "`miterLimit` must be a number"))?.clamp(1.0, 100.0),
         "miterAngle" => {
             let deg = f64_of(v).ok_or_else(|| bad(cmd, "`miterAngle` must be degrees"))?;
             doc.get_mut(id)?.stroke.miter_limit = StrokeProps::miter_limit_for(deg);
@@ -707,7 +728,9 @@ fn apply_corners(cmd: &str, doc: &mut Document, id: NodeId, k: &str, v: &Value) 
                 *slot = r;
             }
         }
-        "cornerSmoothing" => doc.get_mut(id)?.corners.smoothing = f64_of(v).unwrap_or(0.0).clamp(0.0, 1.0),
+        "cornerSmoothing" => {
+            doc.get_mut(id)?.corners.smoothing = f64_of(v).ok_or_else(|| bad(cmd, "`cornerSmoothing` must be a number"))?.clamp(0.0, 1.0)
+        }
         "effects" => doc.get_mut(id)?.effects = effects_from(cmd, v)?,
         "clip" | "clipsContent" => doc.get_mut(id)?.clip = v.as_bool().ok_or_else(|| bad(cmd, "`clip` must be a boolean"))?,
         "isMask" => doc.get_mut(id)?.is_mask = v.as_bool().ok_or_else(|| bad(cmd, format!("`{k}` must be a boolean")))?,
@@ -981,8 +1004,12 @@ fn apply_text(cmd: &str, doc: &mut Document, id: NodeId, props: &Map<String, Val
             text_mut(cmd, doc.get_mut(id)?)?.auto_resize =
                 enum_of(v).ok_or_else(|| bad(cmd, "textAutoResize: widthAndHeight|height|none|truncate"))?
         }
-        "paragraphSpacing" => text_mut(cmd, doc.get_mut(id)?)?.paragraph_spacing = f64_of(v).unwrap_or(0.0).max(0.0),
-        "paragraphIndent" => text_mut(cmd, doc.get_mut(id)?)?.paragraph_indent = f64_of(v).unwrap_or(0.0).max(0.0),
+        "paragraphSpacing" => {
+            text_mut(cmd, doc.get_mut(id)?)?.paragraph_spacing = f64_of(v).ok_or_else(|| bad(cmd, "`paragraphSpacing` must be a number"))?.max(0.0)
+        }
+        "paragraphIndent" => {
+            text_mut(cmd, doc.get_mut(id)?)?.paragraph_indent = f64_of(v).ok_or_else(|| bad(cmd, "`paragraphIndent` must be a number"))?.max(0.0)
+        }
         "listStyle" | "indentation" => {
             let t = text_mut(cmd, doc.get_mut(id)?)?;
             let (start, end) = range_of(props, t.char_count());
