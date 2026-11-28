@@ -161,7 +161,7 @@ pub static KEYS: &[Binding] = &[
     // Essential
     k(Essential, "app.actions", &["Cmd+K", "Cmd+/"]).label("Actions…"),
     k(Essential, "help.shortcuts", &["Ctrl+Shift+?"]).both(),
-    k(Essential, "view.toggleUi", &["Cmd+\\"]),
+    k(Essential, "view.toggleUi", &["Cmd+\\", "Cmd+."]),
     k(Essential, "view.fullscreen", &["Ctrl+Cmd+F"]).win(&["F11"]),
     k(Essential, "edit.pickColor", &["I", "Ctrl+C"]).win(&["I"]),
     k(Essential, "app.preferences", &["Cmd+,"]),
@@ -202,6 +202,7 @@ pub static KEYS: &[Binding] = &[
     k(Tools, "tool.highlighter", &["U"]),
     k(Tools, "tool.eraser", &["E"]),
     k(Tools, "tool.stamp", &["W"]),
+    k(Tools, "tool.codeBlock", &["`"]),
     k(Tools, "board.nextSticky", &["Shift+Cmd+Enter"])
         .label("Board: a new sticky beside the selected one, the next shape joined to it, or a mind map node's next sibling")
         .both(),
@@ -316,6 +317,7 @@ pub static KEYS: &[Binding] = &[
     k(Edit, "edit.copyProperties", &["Alt+Cmd+C"]),
     k(Edit, "edit.pasteProperties", &["Alt+Cmd+V"]),
     k(Edit, "edit.copyAsPng", &["Shift+Cmd+C"]),
+    k(Edit, "edit.copyLink", &["Cmd+L"]),
     k(Edit, "file.export", &["Shift+Cmd+E"]),
     k(Edit, "file.import", &["Shift+Cmd+I"]),
     // Transform
@@ -368,6 +370,7 @@ pub static GESTURES: &[(Group, &str, &str, &str)] = &[
     (Selection, "Pick select: next or previous layer", "⇥ / ⇧⇥", "Tab / Shift+Tab"),
     (Selection, "Pick select: into a layer, out to its parent", "↵ / ⇧↵", "Enter / Shift+Enter"),
     (Selection, "Pick select: select the picked layer", "Space", "Space"),
+    (Text, "While editing text: next or previous text layer", "⇥ / ⇧⇥", "Tab / Shift+Tab"),
     (Edit, "Duplicate by dragging", "⌥ drag", "Alt+drag"),
     (Transform, "Nudge (Shift: big nudge)", "← ↑ → ↓", "← ↑ → ↓"),
     (Transform, "Resize by the nudge amount", "⌘ arrows", "Ctrl+arrows"),
